@@ -1,0 +1,779 @@
+---
+title: "Predictors vs Residuals Simulation Summaries"
+format: html
+---
+
+```{r}
+library(ggplot2) # plotting
+library(patchwork) # plot arrangement
+library(purrr) # iterating over conditions
+library(zoo) # moving average for quantile loess 
+
+source(here::here("scripts/helpers.R"))
+```
+
+# Sim 0 
+
+```{r}
+path <- here::here("data/simulation_exports/")
+
+files <- list.files("../data/simulation_exports/") |>
+  grep(x = _, pattern = "sim_0", value = TRUE)
+
+sim_list <- purrr::map(
+  .x = here::here(path, files), 
+  .f = readRDS
+)
+
+names(sim_list) <- files
+
+sim_0_df <- purrr::imap_dfr(
+  .x = sim_list, 
+  .f = ~dplyr::mutate(.x, sim_file = .y)
+) |> 
+  dplyr::mutate(
+    vp = dplyr::case_when(
+      stringr::str_detect(sim_file, "vp1") ~ "vp1", 
+      stringr::str_detect(sim_file, "vp2") ~ "vp2", 
+      stringr::str_detect(sim_file, "vp3") ~ "vp3", 
+      stringr::str_detect(sim_file, "vp4") ~ "vp4"
+    )
+  )
+
+#saveRDS(sim_0_df, "../data/manuscript_exports/sim_0_df.rds")
+```
+
+
+```{r}
+# cols_tfpt
+col_dark <- "#113e3f"
+col_light <- "#1887ac"
+col_primary <- "#1c4c93"
+col_secondary <- "#f6b510"
+col_orange <- "#f27e20"
+col_red <- "#ac2a25"
+```
+
+```{r}
+# Helper functions 
+
+mean_sd <- function (x, mult = 1) 
+{
+  x <- stats::na.omit(x)
+  sd <- mult * sd(x)
+  mean <- mean(x)
+  list(y = mean, ymin = mean - sd, ymax = mean + sd)
+}
+
+round_numeric <- function(df, digits_arg = 3){
+  df |> 
+    dplyr::mutate(across(where(is.numeric), ~round(.x, digits = digits_arg)))
+}
+
+z <- function(x){(x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)}
+
+gen_df <- function(b0 = 0, b1 = 1, sd = 1, n = 1000){
+  id = 1:n
+  x1 = rnorm(n = n)
+  e = rnorm(n = n, sd = sd)
+  y = b0 + b1*x1
+  data.frame(x1 = x1, y = y, e = e)
+}
+
+vp1 <- function(x1, vp_val) 1
+vp2 <- function(x1, vp_val) (5 / (1+exp(-vp_val*(abs(x1)-1))))/2.5
+vp3 <- function(x1, vp_val) exp(vp_val*abs(x1))*1.25
+vp4 <- function(x1, vp_val) (5 / (1+exp(-vp_val*((x1)-1))))/2.5
+
+# Modify a dataset --------------------------------------------------------
+
+modify_df_vp1 <- function(df){
+  df$y <- (df$y + vp1(df$x1)*df$e) # y + 1*error
+  df$x1 <- (df$x1)
+  df$e_mod <- vp1(df$x1)*df$e
+  return(df)
+}
+
+modify_df_vp2 <- function(df, vp2_val){
+  df$y <- (df$y + vp2(df$x1, vp2_val)*df$e)
+  df$x1 <- (df$x1)
+  df$e_mod <- vp2(df$x1, vp2_val)*df$e
+  return(df)
+}
+
+
+modify_df_vp3 <- function(df, vp3_val){
+  df$y <- (df$y + vp3(df$x1, vp3_val)*df$e)
+  df$x1 <- (df$x1)
+  df$e_mod <- vp3(df$x1, vp3_val)*df$e
+  return(df)
+}
+
+modify_df_vp4 <- function(df, vp4_val){
+  df$y <- (df$y + vp4(df$x1, vp4_val)*df$e)
+  df$x1 <- (df$x1)
+  df$e_mod <- vp4(df$x1, vp4_val)*df$e
+  return(df)
+}
+
+quantile_smoother	 <- function(y, x, 
+                               prop_overlap = 0.75, # how much can the windows overlap
+                               window_prop = 0.05, # what proportion of the sample size should each rolling window use?
+                               tau = .95, # quantile 
+                               window_alignment = c("center"), #
+                               window_function = function(x) {quantile(x, tau)}
+)
+{
+  
+  sample_size <- length(y)
+  window_size <- ceiling(sample_size*window_prop)
+  
+  window_distance <- window_size * (1-prop_overlap)
+  
+  
+  # creating our new X and Y
+  zoo.Y <- zoo(x = y, order.by = x)
+  #zoo.X <- attributes(zoo.Y)$index
+  
+  # center align 
+  new.Y <- rollapply(zoo.Y,
+                     width = window_size, 
+                     FUN = window_function,
+                     by = window_distance,
+                     align = "center" 
+  )
+  
+  new.X <- attributes(new.Y)$index
+  new.Y <- as.numeric(new.Y) 
+  
+  
+  # # lowess
+  new.Y.mod <- lowess(new.Y~new.X)
+  new.Y.loess <- new.Y.mod$y
+  
+  return(list(
+    x = new.X, 
+    y.loess = new.Y.loess
+  ))
+}
+
+qli <- function(mod,
+                predictor, 
+                lower_quant = .025,
+                upper_quant = .975,
+                
+                window_prop = 0.10,
+                prop_overlap = 0.75
+){
+
+  
+  residual_vals = z(mod$residuals)
+    predictor_vals = z(mod$model[[predictor]])
+  
+  q_lower <- quantile_smoother(
+    y = residual_vals,
+    x = predictor_vals,
+    prop_overlap = prop_overlap,
+    window_prop = window_prop,
+    tau = lower_quant
+  )
+  
+  q_upper <- quantile_smoother(
+    y = residual_vals,
+    x = predictor_vals,
+    prop_overlap = prop_overlap,
+    window_prop = window_prop,
+    tau = upper_quant
+  )
+  
+  qli <- data.frame(
+    x = q_lower$x,
+    q_lower_y_loess = q_lower$y.loess,
+    q_upper_y_loess = q_upper$y.loess,
+    loess_wide = q_upper$y.loess - q_lower$y.loess, 
+    predictor_name = predictor
+  )
+  
+  return(qli)
+}
+```
+
+<!--# Results plots -->
+
+```{r}
+# Convert into an intial long format for plotting method summaries
+sim_0_df_long <- sim_0_df |> 
+  dplyr::select(b1, n, vp_val, estimate_x1, std.error_x1, overall_mod_r2, prop_overlap, 
+                white_r2, white_statistic, white_p,  vp, contains("quantreg")) |> 
+  dplyr::select(!contains("Intercept")) |> 
+  tidyr::pivot_longer(
+    cols = -c(b1, n, vp_val, estimate_x1, std.error_x1, overall_mod_r2, vp, prop_overlap, 
+              white_r2, white_statistic, white_p)
+  ) |> 
+  dplyr::mutate(
+    predictor = dplyr::case_when(
+      stringr::str_detect(name, "predictor") ~ "x1", 
+      TRUE ~ "full model"
+    ), 
+    trend = dplyr::case_when(
+      stringr::str_detect(name, "I.x.2") ~ "x^2", 
+      stringr::str_detect(name, "I.x.3") ~ "x^3", 
+      stringr::str_detect(name, "I.x.4") ~ "x^4", 
+      TRUE ~ "x^1"
+    ) |> factor()
+  )
+
+# Helper file for data-wrangling 
+sd_rank_helper <- sim_0_df_long |> 
+  dplyr::group_by(vp, vp_val) |> 
+  dplyr::summarise(n = dplyr::n()) |> 
+  dplyr::mutate(
+    sd_ratio = dplyr::case_when(
+      vp == "vp1" ~ 0, 
+      vp == "vp2" ~ dplyr::dense_rank(vp_val), 
+      vp == "vp3" ~ rev(dplyr::dense_rank(vp_val)), 
+      vp == "vp4" ~ dplyr::dense_rank(vp_val)
+    )
+  )|> 
+  dplyr::ungroup() |> 
+  dplyr::mutate(
+    sd_ratio = factor(sd_ratio, labels = c(1, 1.15, 1.3, 1.5, 2.2, 2.8))
+  )  |> 
+  dplyr::select(-n)
+
+# Final long format
+sim_0_df_long <- dplyr::left_join(sim_0_df_long, sd_rank_helper, by = c("vp", "vp_val"))
+
+sim_0_df_long <- 
+  dplyr::bind_rows(
+    sim_0_df_long, 
+    sim_0_df_long |> dplyr::mutate(vp = ifelse(vp == "vp1", "vp2", vp)), 
+    sim_0_df_long |> dplyr::mutate(vp = ifelse(vp == "vp1", "vp3", vp)),
+    sim_0_df_long |> dplyr::mutate(vp = ifelse(vp == "vp1", "vp4", vp))
+  ) 
+```
+
+## QLI performance
+
+```{r}
+# method summary table 
+t_method_sum <- sim_0_df_long |> 
+  dplyr::filter(vp != "vp1")|> 
+  dplyr::filter(b1 == 0.15, predictor == "x1", prop_overlap == 0.75) |> 
+  dplyr::group_by(n , sd_ratio, trend, vp) |> 
+  dplyr::summarise(
+    mean = mean(value), 
+    sd = sd(value),
+    sd_lower = mean_sd(value)$ymin, 
+    sd_upper = mean_sd(value)$ymax
+  ) 
+
+# method summary plot 
+p_method <- t_method_sum |>
+  dplyr::ungroup() |> 
+  dplyr::mutate(
+    vp = factor(vp, labels = c("Butterfly", "Inverse butterfly", "Funnel")), 
+    trend = factor(trend, 
+                   labels = c("linear", "quadratic", "cubic", "quartic")), 
+    n = factor(n, labels = paste0("n = ", c(30, 60, 120, 600)))
+    ) |> 
+  ggplot2::ggplot(data = _, aes(x = sd_ratio, y = mean, 
+                                colour = trend, linetype = trend, group = trend)) + 
+  geom_line(position = position_dodge(width = 0.1)) + 
+  geom_point(position = position_dodge(width = 0.1), show.legend = FALSE) + 
+  geom_errorbar(position = position_dodge(width = 0.1),
+                aes(ymin = sd_lower, ymax = sd_upper),
+                width = 0,  linetype = "solid", show.legend = FALSE) +
+  geom_errorbar(position = position_dodge(width = 0.1), 
+                aes(ymin = sd_lower, ymax = sd_upper), 
+                width = 0) + 
+  #scale_colour_viridis_d(option = "A", begin = 0.3, end = 0.9) + 
+  scale_colour_manual(values = c(col_light, col_dark, col_secondary, col_orange)) + 
+  scale_linetype_manual(values = c("solid", "dotted", "dashed", "dotdash")) + 
+  facet_grid(cols = vars(n), rows = vars(vp)) + 
+  labs(x = "Heteroscedasticity level (SD ratio)", y = "QLI estimate", 
+       colour = "Trend", linetype = "Trend") + 
+theme_light() + 
+  theme(
+    legend.position = "top", 
+    text = element_text(family = "Times")
+  )
+```
+
+```{r}
+p_method
+```
+
+## White test comparison
+
+(not reported, for info only)
+
+```{r}
+# Table for white summaries 
+t_white_sum <- sim_0_df_long |> 
+  dplyr::filter(vp != "vp1")|> 
+  dplyr::filter(b1 == 0.15, predictor == "x1", prop_overlap == 0.75, trend == "x^1") |> 
+  dplyr::mutate(is_white_sig = white_p < 0.05) |> 
+  dplyr::group_by(n, vp, trend, sd_ratio) |> 
+  dplyr::summarise(n_white_sig = sum(is_white_sig)/dplyr::n())
+
+# Plot for white summaries 
+p_white_sum <- 
+  t_white_sum |> 
+    dplyr::ungroup() |> 
+    dplyr::mutate(
+    vp = factor(vp, labels = paste0("VP", 2:4)), 
+    n = factor(n, labels = paste0("n = ", c(30, 60, 120, 600)))
+  ) |> 
+  ggplot2::ggplot(data = _, aes(x = sd_ratio, y = n_white_sig, 
+                                linetype = vp,
+                                colour = vp, group = vp)) + 
+  geom_point() + 
+  geom_path() + 
+  scale_colour_manual(values = c(col_light, col_dark, col_orange)) +
+    scale_linetype_manual(values = c("solid", "dotted", "dashed", "dotdash")) +
+  facet_grid(cols = vars(n)) + 
+  labs(x = "Heteroscedasticity level (SD ratio)", y = "Proportion of p < .05", 
+       colour = "Variance pattern", linetype = "Variance pattern") + 
+  theme_light() + 
+  theme(
+    legend.position = "top", 
+    text = element_text(family = "Times")
+  )
+
+```
+
+```{r}
+p_white_sum
+```
+
+## Power and false positives
+
+```{r}
+# Power summaries pre-processing 
+sim_0_df_mod <- sim_0_df |> 
+  dplyr::filter(prop_overlap == 0.75) |> 
+  dplyr::select(b1, n, vp_val, vp, estimate_x1, conf.low_x1, conf.high_x1, p.value_x1) 
+
+sim_0_df_mod <- dplyr::left_join(sim_0_df_mod, sd_rank_helper, by = c("vp_val", "vp"))
+
+# Power summary
+sim_0_power_sum <- sim_0_df_mod |> 
+  dplyr::mutate(
+    sig = p.value_x1 < 0.05
+  ) |> 
+  dplyr::group_by(b1, n, vp, sd_ratio) |> 
+  dplyr::summarise(
+    power = sum(sig) / dplyr::n()
+  )
+
+# Coverage summary
+sim_0_cover_sum <- sim_0_df_mod |> 
+  dplyr::mutate(
+    covered = dplyr::between(b1, conf.low_x1, conf.high_x1)
+  )|> 
+  dplyr::group_by(b1, n, vp, sd_ratio) |> 
+  dplyr::summarise(
+    coverage = sum(covered) / dplyr::n()
+  )
+
+# CI width summary
+sim_0_ci_sum <- sim_0_df_mod |> 
+  dplyr::mutate(
+    ci_width = conf.high_x1 - conf.low_x1
+  )|> 
+  dplyr::group_by(b1, n, vp, sd_ratio) |> 
+  dplyr::summarise(
+    ci_width = mean(ci_width)
+  )
+
+# coverage sum
+sim_0_qh_sum <- sim_0_df_long |> 
+  dplyr::filter(prop_overlap == 0.75)|> 
+  dplyr::filter(predictor == "x1") |> 
+  dplyr::filter(
+    (vp == "vp1" & trend == "x^1") |
+    (vp == "vp2" & trend == "x^2") |
+    (vp == "vp3" & trend == "x^2") |
+    (vp == "vp4" & trend == "x^1") 
+  ) |> 
+  dplyr::group_by(n, b1, sd_ratio, trend, vp, prop_overlap) |> 
+  dplyr::summarise(
+    mean_value = mean(value)
+  )
+
+# merge coverage and power summaries
+sim_0_ols_perf <- dplyr::left_join(sim_0_power_sum, sim_0_cover_sum) |> 
+  dplyr::left_join(x = _, y = sim_0_ci_sum)
+
+# merge coverage and power summaries with method estimates
+t_ols_sum <- dplyr::left_join(sim_0_qh_sum, sim_0_ols_perf)
+```
+
+```{r}
+# Power plot function 
+trend_power_plot <- function(vp_arg = "vp2", legend_position_arg = "none", x_lab_arg = "", y_lab_arg = "", grid_label_arg = "HELLO"){
+  
+  t_ols_sum |>
+    dplyr::ungroup() |> 
+    dplyr::mutate(
+      b1 = factor(b1), 
+      n = factor(n, labels = paste0("n = ", c(30, 60, 120, 600))),
+      grid_label = grid_label_arg
+      ) |> 
+    dplyr::filter(!is.na(power)) |> 
+    dplyr::filter(vp %in% c("vp1", vp_arg)) |> 
+    dplyr::filter(prop_overlap == .75) |> 
+    
+    ggplot2::ggplot(data = _, aes(x = mean_value, y = power, 
+                                  linetype = b1,
+                                  colour = b1, group = b1)) + 
+    geom_point() + 
+    
+    geom_line() + 
+    labs(x = x_lab_arg, y = y_lab_arg, colour = "Effect size (b)", linetype = "Effect size (b)") + 
+    facet_grid(rows = vars(grid_label), cols = vars(n)) + 
+    theme_light() + 
+    scale_colour_manual(values = c(col_light, col_dark, col_secondary, col_orange)) + 
+  scale_linetype_manual(values = c("solid", "dotted", "dashed", "dotdash")) +
+    theme(
+      legend.position = legend_position_arg, 
+      text = element_text(family = "Times")
+    )
+  
+}
+
+# Power plots
+p_power <- 
+  trend_power_plot("vp2", "top", grid_label_arg = "Butterfly") / 
+  trend_power_plot("vp3", y_lab_arg = "Proportion of p < .05", grid_label_arg = "Inverse butterfly") /
+  trend_power_plot("vp4", x_lab_arg = "QLI estimate", grid_label_arg = "Funnel")
+
+```
+
+```{r}
+p_power
+```
+
+## Coverage of CIs
+
+```{r}
+# Coverage plots function 
+trend_coverage_plot <- function(vp_arg = "vp2", legend_position_arg = "none", x_lab_arg = "", y_lab_arg = "", grid_label_arg = "HELLO"){
+  
+  t_ols_sum |>
+    dplyr::ungroup() |> 
+    dplyr::mutate(b1 = as.factor(b1), 
+    n = factor(n, labels = paste0("n = ", c(30, 60, 120, 600))), 
+    grid_label = grid_label_arg
+    ) |> 
+    dplyr::filter(!is.na(coverage)) |> 
+    dplyr::filter(vp %in% c("vp1", vp_arg)) |> 
+    dplyr::filter(prop_overlap == .75) |> 
+    
+    ggplot2::ggplot(data = _, aes(x = mean_value, y = coverage, 
+                                  linetype = b1,
+                                  colour = b1, group = b1)) + 
+    geom_point() + 
+    geom_line() + 
+    labs(x = x_lab_arg, y = y_lab_arg, colour = "Effect size (b)", linetype = "Effect size (b)") + 
+    facet_grid(rows = vars(grid_label), cols = vars(n)) + 
+    theme_light() + 
+    coord_cartesian(ylim = c(0.75, 1)) + 
+    scale_colour_manual(values = c(col_light, col_dark, col_secondary, col_orange)) + 
+    scale_linetype_manual(values = c("solid", "dotted", "dashed", "dotdash")) +
+    theme(
+      legend.position = legend_position_arg, 
+      text = element_text(family = "Times")
+    )
+  
+}
+
+# Coverage plots
+p_cover <- trend_coverage_plot("vp2", "top",  grid_label_arg = "Butterfly") /
+  trend_coverage_plot("vp3", y_lab_arg = "CI coverage",  grid_label_arg = "Inverse butterfly") /
+  trend_coverage_plot("vp4", x_lab_arg = "QLI estimate",  grid_label_arg = "Funnel")
+```
+
+```{r}
+p_cover
+```
+
+
+## CI width
+
+```{r}
+# CI width function 
+trend_ci_plot <- function(vp_arg = "vp2", legend_position_arg = "none", x_lab_arg = "", y_lab_arg = "", grid_label_arg = "HELLO"){
+  
+  t_ols_sum |>
+    dplyr::ungroup() |> 
+    dplyr::mutate(b1 = as.factor(b1), 
+    n = factor(n, labels = paste0("n = ", c(30, 60, 120, 600))), 
+     grid_label = grid_label_arg) |> 
+    dplyr::filter(!is.na(ci_width)) |> 
+    dplyr::filter(vp %in% c("vp1", vp_arg)) |> 
+    dplyr::filter(prop_overlap == .75) |> 
+    
+    ggplot2::ggplot(data = _, aes(x = mean_value, y = ci_width, 
+                                  linetype = b1,
+                                  colour = b1, group = b1)) + 
+    geom_point() + 
+    
+    geom_line() + 
+     labs(x = x_lab_arg, y = y_lab_arg, colour = "Effect size (b)", linetype = "Effect size (b)") +  
+    facet_grid(rows = vars(grid_label), cols = vars(n)) + 
+    theme_light() + 
+    coord_cartesian(ylim = c(0,1)) + 
+    scale_colour_manual(values = c(col_light, col_dark, col_secondary, col_orange)) + 
+    scale_linetype_manual(values = c("solid", "dotted", "dashed", "dotdash")) +
+    theme(
+      legend.position = legend_position_arg, 
+      text = element_text(family = "Times")
+    )
+  
+}
+
+# Coverage plots
+p_ci <- trend_ci_plot("vp2", "top",  grid_label_arg = "Butterfly") /
+  trend_ci_plot("vp3", y_lab_arg = "CI width",  grid_label_arg = "Inverse butterfly") /
+  trend_ci_plot("vp4", x_lab_arg = "QLI estimate",  grid_label_arg = "Funnel")
+```
+
+
+```{r}
+p_ci
+```
+
+## SD of effects 
+
+(not reported, for info only)
+
+```{r fig.width=10, fig.height=3.5, warning=FALSE, message = FALSE}
+sim_0_df_long |> 
+  dplyr::filter(vp != "vp1")|> 
+  dplyr::filter(b1 == 0.15, predictor == "x1", trend == "x^1", prop_overlap == 0.75) |> 
+  dplyr::mutate(n = factor(n)) |> 
+  ggplot2::ggplot(data = _, aes(x = sd_ratio, y = estimate_x1, colour = n, group = n)) + 
+  stat_summary(fun = sd, position = position_dodge(width = 0.1)) + 
+ # stat_summary(fun.y = median, position = position_dodge(width = 0.1)) + 
+  stat_summary(geom = "line", fun = sd, position = position_dodge(width = 0.1)) + 
+  scale_colour_viridis_d(option = "A", begin = 0.3, end = 0.9) + 
+  labs(y = "SD of b estimates") + 
+  facet_grid(cols = vars(vp)) + 
+  theme_light() + 
+  theme(
+    legend.position = "top"
+  )
+```
+
+
+## R-squared 
+
+(not reported, for info only)
+
+```{r fig.width=10, fig.height=3.5, warning=FALSE, message = FALSE}
+sim_0_df_long |> 
+  dplyr::filter(vp != "vp1")|> 
+  dplyr::filter(b1 == 0.15, predictor == "x1", trend == "x^1", prop_overlap == 0.75) |> 
+  dplyr::mutate(n = factor(n)) |> 
+  ggplot2::ggplot(data = _, aes(x = sd_ratio, y = overall_mod_r2, colour = n, group = n)) + 
+  stat_summary(fun.data = mean_sd, position = position_dodge(width = 0.4)) + 
+ # stat_summary(fun.y = median, position = position_dodge(width = 0.1)) + 
+  stat_summary(geom = "line", fun.data = mean_sd, position = position_dodge(width = 0.4)) + 
+  scale_colour_viridis_d(option = "A", begin = 0.3, end = 0.9) + 
+  labs(y = "R^2") + 
+  facet_grid(cols = vars(vp)) + 
+  theme_light() + 
+  theme(
+    legend.position = "top"
+  )
+```
+
+# Sim 1 
+
+
+```{r}
+sim = "sim_1"
+
+path <- here::here("data/simulation_exports/")
+
+files <- list.files("../data/simulation_exports/") |> 
+  grep(x = _, pattern = sim, value = TRUE)
+
+sim_list <- purrr::map(
+  .x = here::here(path, files), 
+  .f = readRDS
+)
+
+names(sim_list) <- files
+
+sim_1_df <- purrr::imap_dfr(
+  .x = sim_list, 
+  .f = ~dplyr::mutate(.x, sim_file = .y)
+) |> 
+  dplyr::mutate(
+    vp = dplyr::case_when(
+      stringr::str_detect(sim_file, "vp1") ~ "vp1", 
+      stringr::str_detect(sim_file, "vp2") ~ "vp2", 
+      stringr::str_detect(sim_file, "vp3") ~ "vp3", 
+      stringr::str_detect(sim_file, "vp4") ~ "vp4"
+    )
+  )
+```
+
+```{r}
+sim_1_df_long <- sim_1_df |> 
+  dplyr::select(b2, n, vp_val, vp, prop_overlap, contains("predictor")) |> 
+  dplyr::select(!contains('Intercept')) |> 
+  tidyr::pivot_longer(
+    cols = contains("quantreg")
+  ) |> 
+  dplyr::mutate(
+    predictor = ifelse(stringr::str_detect(name, "x1"), "x1", "x2"), 
+    trend = dplyr::case_when(
+      stringr::str_detect(name, "I.x.2") ~ "x^2", 
+      stringr::str_detect(name, "I.x.3") ~ "x^3", 
+      stringr::str_detect(name, "I.x.4") ~ "x^4", 
+      TRUE ~ "x^1"
+    ) |> factor()
+  ) |> 
+  dplyr::group_by(vp) |> 
+  dplyr::mutate(
+    sd_ratio = dplyr::case_when(
+      vp == "vp1" ~ 0, 
+      vp == "vp2" ~ dplyr::dense_rank(vp_val), 
+      vp == "vp3" ~ rev(dplyr::dense_rank(vp_val)), 
+      vp == "vp4" ~ dplyr::dense_rank(vp_val)
+    )
+  ) |> 
+  dplyr::ungroup() |> 
+  dplyr::mutate(
+    vp_val = ifelse(vp == "vp1", 0, vp_val),
+    sd_ratio = factor(sd_ratio, labels = c(1, 1.15, 2.8))
+  ) 
+
+sim_1_df_long <- 
+  dplyr::bind_rows(
+    sim_1_df_long, 
+    sim_1_df_long |> dplyr::mutate(vp = ifelse(vp == "vp1", "vp2", vp)), 
+    sim_1_df_long |> dplyr::mutate(vp = ifelse(vp == "vp1", "vp3", vp)),
+    sim_1_df_long |> dplyr::mutate(vp = ifelse(vp == "vp1", "vp4", vp))
+  )
+```
+
+## heteroscedastoict predictor
+
+```{r message = FALSE}
+sim_1_df_long |> 
+  dplyr::filter(vp != "vp1")|> 
+  dplyr::filter(predictor == "x1", n == 500) |> 
+  ggplot2::ggplot(data = _, aes(x = sd_ratio, y = value, colour = trend, group = trend)) + 
+  stat_summary(fun.data = mean_sd, position = position_dodge(width = 0.1)) + 
+  stat_summary(geom = "line", position = position_dodge(width = 0.2)) + 
+  scale_colour_viridis_d(option = "A", begin = 0.3, end = 0.8) + 
+  facet_grid(cols = vars(prop_overlap), rows = vars(vp)) + 
+  theme_light() + 
+  theme(
+    legend.position = "top"
+  )
+```
+
+## homoscedastic predictor
+
+```{r message = FALSE}
+sim_1_df_long |> 
+  dplyr::filter(vp != "vp1")|> 
+  dplyr::filter(predictor == "x2", n == 120) |> 
+  ggplot2::ggplot(data = _, aes(x = sd_ratio, y = value, colour = trend, group = trend)) + 
+  stat_summary(fun.data = mean_sd, position = position_dodge(width = 0.1)) + 
+  stat_summary(geom = "line", position = position_dodge(width = 0.2)) + 
+  scale_colour_viridis_d(option = "A", begin = 0.3, end = 0.8) + 
+  facet_grid(cols = vars(prop_overlap), rows = vars(vp)) + 
+  theme_light() + 
+  coord_cartesian(ylim = c(-2,2)) + 
+  theme(
+    legend.position = "top"
+  )
+```
+
+
+# Sim 2 
+
+```{r}
+sim = "sim_2"
+
+path <- here::here("data/simulation_exports/")
+
+files <- list.files("../data/simulation_exports/") |> 
+  grep(x = _, pattern = sim, value = TRUE)
+
+sim_list <- purrr::map(
+  .x = here::here(path, files), 
+  .f = readRDS
+)
+
+names(sim_list) <- files
+
+sim_2_df <- purrr::imap_dfr(
+  .x = sim_list, 
+  .f = ~dplyr::mutate(.x, sim_file = .y)
+) |> 
+  dplyr::mutate(
+    vp = dplyr::case_when(
+      stringr::str_detect(sim_file, "vp1") ~ "vp1", 
+      stringr::str_detect(sim_file, "vp2") ~ "vp2", 
+      stringr::str_detect(sim_file, "vp3") ~ "vp3"
+    )
+  )
+```
+
+## Variance ratio
+
+```{r warning = FALSE}
+sim_2_df |> 
+  # dplyr::select(b1, b2, b_c1, var_pattern, n, prop_overlap, vr_predictor_x1) |> 
+  dplyr::filter(b1 == 0.15, b2 == 0.15, n == 600) |>  
+  ggplot2::ggplot(data = _, aes(x = as.factor(b_c1), y = vr_predictor_x1
+                                # colour = as.factor(n)
+  )
+  )+
+  #stat_summary(fun.data = mean_sd) + 
+  stat_summary(fun.y = median) + 
+  # geom_boxplot() + 
+  #coord_cartesian(ylim = c(0,8)) + 
+  facet_grid(cols = vars(prop_overlap), rows = vars(var_pattern)) + 
+  theme_light()
+```
+
+## QLI
+
+```{r}
+sim_2_df_long_qh <- sim_2_df |> 
+  dplyr::select(b1, b2, b_c1, var_pattern, n, prop_overlap, contains("predictor_c1")) |> 
+  dplyr::select(!contains("Intercept")) |> 
+  tidyr::pivot_longer(
+    cols = contains("quantreg") 
+  ) |> 
+  dplyr::mutate(
+    trend = dplyr::case_when(
+      stringr::str_detect(name, "I.x.2") ~ "x^2", 
+      stringr::str_detect(name, "I.x.3") ~ "x^3", 
+      stringr::str_detect(name, "I.x.4") ~ "x^4", 
+      TRUE ~ "x^1"
+    ) |> factor()
+  )
+```
+
+```{r}
+sim_2_df_long_qh |> 
+  dplyr::filter(b1 == 0.15, b2 == 0.6, n == 120) |> 
+  ggplot2::ggplot(data = _, aes(x = as.factor(b_c1), y = value, colour = trend)) + 
+  stat_summary(fun.data = mean_sd, position = position_dodge(width = 0.5)) + 
+  scale_colour_viridis_d(option = "A", begin = 0.3, end = 0.8) + 
+  facet_grid(cols = vars(prop_overlap), rows = vars(var_pattern)) + 
+  coord_cartesian(ylim = c(-2, 2)) + 
+  theme_light()
+```
+
+

@@ -1,0 +1,1153 @@
+---
+title: "Predictors vs residuals"
+format: html
+editor: 
+  markdown: 
+    wrap: 72
+---
+
+```{r}
+library(ggplot2) # plotting
+library(patchwork) # plot arrangement
+library(purrr) # iterating over conditions
+library(zoo) # moving average for quantile loess 
+
+source(here::here("scripts/helpers.R"))
+```
+
+# Single predictor model
+
+```{r}
+n = 1000
+
+df_i <- gen_df() |> 
+  modify_df_vp4(vp4_val = vp4_val[5]) 
+
+
+mod_i <- df_i |> lm(y ~ x1, data = _) 
+
+plot(mod_i, which = 1)
+
+plot(df_i$x1, mod_i$residuals)
+
+```
+
+# 2 predictor model
+
+```{r}
+n = 1000
+
+gen_df_mult <- function(b0 = 0, b1 = 0.38, b2 = 0.38, sd = 1, n = 1000){
+  id = 1:n
+  x1 = rnorm(n = n)
+  x2 = rnorm(n = n)
+  e = rnorm(n = n, sd = sd)
+  y = b0 + b1*x1 + b2*x2
+  data.frame(x1 = x1, x2, y = y, e = e)
+}
+
+
+df_i <- gen_df_mult() |> 
+  modify_df_vp4(vp4_val = vp4_val[5]) 
+
+
+mod_i <- df_i |> lm(y ~ x1 + x2, data = _) 
+
+plot(mod_i, which = 1)
+
+plot(df_i$x1, mod_i$residuals)
+plot(df_i$x2, mod_i$residuals)
+
+```
+
+# Model with a covariate
+
+```{r}
+set.seed(123023)
+df_cov_i <- gen_df_cov(b1 = 0.3, b2 = 0.6, b_c1 = 0.45, n = 1200, sd_vals = c(2.8, 1, 2.8)) 
+
+mod_cov_i <- df_cov_i |> lm(y ~ x1 + c1, data = _)
+
+
+plot(mod_cov_i, which = 1)
+plot(df_cov_i$x1, mod_cov_i$residuals)
+plot(df_cov_i$c1, mod_cov_i$residuals)
+
+```
+
+# Functions
+
+## Helpers
+
+```{r}
+gen_df_mult <- function(b0 = 0, b1 = 0.38, b2 = 0.38, sd = 1, n = 1000){
+  id = 1:n
+  x1 = rnorm(n = n)
+  x2 = rnorm(n = n)
+  e = rnorm(n = n, sd = sd)
+  y = b0 + b1*x1 + b2*x2
+  data.frame(x1 = x1, x2, y = y, e = e)
+}
+
+gen_df_cov <- function(b1 = 0.75, b2 = 1.5, b_c1 = 0.15, var_pattern, n = 120){
+  
+  sd_vals <- as.numeric(stringr::str_split(var_pattern, pattern = "-")[[1]])
+  
+  df_cov_i <- tibble::tibble(
+    group = rep(c(1,2,3), each = round(n/3)), 
+    group_2v1 = dplyr::case_when(
+      group == 1 ~ 0, 
+      group == 2 ~ 1, 
+      group == 3 ~ 0
+    ), 
+    group_3v1 = dplyr::case_when(
+      group == 1 ~ 0, 
+      group == 2 ~ 0, 
+      group == 3 ~ 1
+    ), 
+    sd = rep(c(sd_vals), each = round(n/3))
+  ) |> 
+    #dplyr::slice_sample(n = n) |> 
+    dplyr::mutate(
+      e = rnorm(n, 0, 1),
+      c1 = rnorm(n, 0, 1),
+      #y = b1*group_2v1 + b2*group_3v1 + b_c1*c1 + sd*e, 
+      y = rnorm(n, mean = b1*group_2v1 + b2*group_3v1 + b_c1*c1, sd = sd),
+      x1 = factor(group)
+    ) 
+  return(df_cov_i)
+}
+
+extract_predictors <- function(mod){
+  
+  predictors <- attributes(mod$terms)$dataClasses[-1]
+  factors <- names(predictors[which(predictors == "factor")])
+  numeric <- names(predictors[which(predictors == "numeric")])
+  
+  return(
+    list(
+      factors = factors, 
+      numeric = numeric
+    )
+  )
+  
+}
+
+extract_outcome <- function(mod){
+  names(attributes(mod$terms)$dataClasses[1])
+}
+
+mod_vals_wide <- function(mod){
+  broom::tidy(mod, conf.int = TRUE) |> 
+    tidyr::pivot_wider(
+      names_from = term, 
+      values_from = c(estimate, std.error, statistic,  p.value, conf.low, conf.high))
+}
+
+mod_vals_overall <- function(mod){
+  
+  broom::glance(mod) |> 
+    dplyr::select(
+      overall_mod_r2 = r.squared, 
+      overall_mod_f = statistic, 
+      overall_mod_p = p.value, 
+      overall_mod_residual_se = sigma
+    )
+
+}
+
+quantreg_interval <- function(mod,
+                              lower_quant = .025,
+                              upper_quant = .975,
+
+                              window_prop = 0.05,
+                              prop_overlap = 0.95
+){
+
+
+  q_lower <- quantile_smoother(
+    y = z(mod$residuals),
+    x = z(mod$fitted.values),
+    prop_overlap = prop_overlap,
+    window_prop = window_prop,
+    tau = lower_quant
+  )
+
+  q_upper <- quantile_smoother(
+    y = z(mod$residuals),
+    x = z(mod$fitted.values),
+    prop_overlap = prop_overlap,
+    window_prop = window_prop,
+    tau = upper_quant
+  )
+
+  quantreg_interval <- data.frame(
+    x = q_lower$x,
+    q_lower_y_loess = q_lower$y.loess,
+    q_upper_y_loess = q_upper$y.loess,
+    loess_wide = q_upper$y.loess - q_lower$y.loess
+  )
+
+  return(quantreg_interval)
+}
+
+quantreg_interval_pred <- function(mod,
+                              predictor, 
+                              lower_quant = .025,
+                              upper_quant = .975,
+
+                              window_prop = 0.05,
+                              prop_overlap = 0.95
+){
+
+  q_lower <- quantile_smoother(
+    y = z(mod$residuals),
+    x = z(mod$model[[predictor]]),
+    prop_overlap = prop_overlap,
+    window_prop = window_prop,
+    tau = lower_quant
+  )
+
+  q_upper <- quantile_smoother(
+    y = z(mod$residuals),
+    x = z(mod$model[[predictor]]),
+    prop_overlap = prop_overlap,
+    window_prop = window_prop,
+    tau = upper_quant
+  )
+
+  quantreg_interval <- data.frame(
+    x = q_lower$x,
+    q_lower_y_loess = q_lower$y.loess,
+    q_upper_y_loess = q_upper$y.loess,
+    loess_wide = q_upper$y.loess - q_lower$y.loess
+  )
+
+  return(quantreg_interval)
+}
+
+var_ratio <- function(mod, cat_predictor){
+  
+  # var_sum <- mod$model |> 
+  #   dplyr::group_by(!!sym(cat_predictor)) |> 
+  #   dplyr::summarise(var = var(!!sym(outcome)), na.rm = TRUE)
+  
+ var_sum <- mod |> 
+    broom::augment() |> 
+    dplyr::mutate(z_resid = z(.resid)) |> 
+    dplyr::group_by(!!sym(cat_predictor)) |> 
+    dplyr::summarise(var = var(z_resid), na.rm = TRUE)
+  
+  data.frame(
+    vr = max(var_sum$var, na.rm = TRUE) / min(var_sum$var, na.rm = TRUE)
+  )
+}
+
+
+# qr_mod_coefs <- function(mod){
+#   mod$coefficients[-1] |> t() |> data.frame()
+# }
+
+quantreg_mod_coefs <- function(quantreg_mod){
+  quantreg_mod <- quantreg_mod$coefficients |> 
+    t() |> 
+    as.data.frame()
+  
+  names(quantreg_mod) <- paste0("quantreg_", names(quantreg_mod))
+  
+  return(quantreg_mod)
+}
+ 
+append_predictor_labels <- function(data, predictor_name) {
+  names(data) <- paste(names(data), "predictor", predictor_name, sep = "_")
+  return(data)
+}
+
+vp1 <- function(x1, vp_val) 1
+#vp2 <- function(x1, vp_val) {5 / (1+exp(-vp_val*(abs(x1)-1)))}
+vp2 <- function(x1, vp_val) (5 / (1+exp(-vp_val*(abs(x1)-1))))/2.5
+vp3 <- function(x1, vp_val) exp(vp_val*abs(x1))
+vp4 <- function(x1, vp_val) (5 / (1+exp(-vp_val*((x1)-1))))/2.5
+
+# e.g.: 
+#vp <- vp3
+
+modify_df <- function(df, vp_val){
+  df$y <- (df$y + vp(df$x1, vp_val)*df$e)
+  df$x1 <- (df$x1)
+  return(df)
+}
+
+
+white_test <- function(mod){
+  
+  data <- mod$model
+  u2 <- mod$residuals^2
+  y <- fitted(mod)
+  Ru2<- summary(lm(u2 ~ y + I(y^2)))$r.squared
+  LM <- nrow(data)*Ru2
+  p.value <- 1-pchisq(LM, 2)
+  
+  return(
+    data.frame(
+      white_r2 = Ru2,
+      white_statistic = LM,
+      white_p = p.value
+    )
+  )
+}
+```
+
+## Simulation function
+
+1.  Simulate data
+2.  Fit the model
+3.  Extract model summary (for power summaries)
+4.  Extract outcome, numeric predictors and categorical predictors
+5.  Compute quantreg interval values (full model and predictors)
+6.  Compute variance ratios
+7.  Return values
+
+Simulations:
+
+0.  One continuous predictor
+
+1.  Two continuous predictors - also a situation where the
+    non-heteroscedastic predictor has a large effect that masks total
+    heteroscedasticity.
+
+2.  One categorical, one continuous predictor, with heteroscedastic
+    categorical predictor.
+
+```{r}
+run_sim <- function(
+    sim, 
+    b1, b2, b_c1, 
+    var_pattern,
+    n,
+    vp_val, 
+    lower_quant,
+    upper_quant,
+    window_prop,
+    prop_overlap){
+  
+  # Simulate data #### 
+  
+  ## Sim 0 ####
+  
+  if(sim == 0){
+    
+    df_i <- gen_df(b1 = b1, n = n) |> 
+      modify_df(df = _, vp_val = vp_val)
+    
+    mod_i <- lm(y ~ x1, data = df_i)
+    
+  }
+  
+  ## Sim 1 ####
+  
+  if(sim == 1){
+    
+    df_i <- gen_df_mult(b0 = 0, b1 = b1, b2 = b2, n = n) |> 
+      modify_df(df = _, vp_val = vp_val)
+    
+    # Fit the model ####
+    mod_i <- lm(y ~ x1 + x2, data = df_i)
+    
+  }
+  
+  ## Sim 2 #### 
+  
+  if(sim == 2){
+    
+    df_i <- gen_df_cov(b1 = b1, b2 = b2, b_c1 = b_c1, n = n, var_pattern = var_pattern) 
+    mod_i <- df_i |> lm(y ~ x1 + c1, data = _)
+    
+  }
+  
+  # # Fit the model ####
+  
+  # Extract model summary ####
+  mod_vals_i <- mod_vals_wide(mod_i) # export this 
+  
+  # Extract outcome, numeric predictors and categorical predictors ####
+  outcome_i <- extract_outcome(mod_i)
+  predictors_i <- extract_predictors(mod_i)
+  categorical_predictors_i <- predictors_i$factors
+  numeric_predictors_i <- predictors_i$numeric
+  
+  if(sim %in% c(0,1,2)){
+    
+    # Quantreg interval: full model ####
+    
+    quantreg_interval_full_i <- suppressWarnings(
+      quantreg_interval(
+        mod_i, 
+        lower_quant = lower_quant, 
+        upper_quant = upper_quant, 
+        window_prop = window_prop, 
+        prop_overlap = prop_overlap
+      )
+    )
+    
+    quantreg_interval_full_mod_i <- 
+      lm(loess_wide ~ x + I(x^2) + I(x^3) + I(x^4), data = quantreg_interval_full_i) |> 
+      quantreg_mod_coefs() # export this 
+    
+    # Quantreg interval: predictors #### 
+    
+    quantreg_list <- suppressWarnings(
+      purrr::map(
+        .x = numeric_predictors_i, 
+        .f = ~quantreg_interval_pred(
+          mod = mod_i, 
+          lower_quant = lower_quant, 
+          upper_quant = upper_quant, 
+          window_prop = window_prop, 
+          prop_overlap = prop_overlap,
+          predictor = .x
+        )
+      )
+    )
+    
+    quantreg_mod_list <- purrr::map(
+      .x = quantreg_list, 
+      .f = ~lm(loess_wide ~ x + I(x^2) + I(x^3) + I(x^4), data = .x)
+    )
+    
+    quantreg_coeff_list <- purrr::map(
+      .x = quantreg_mod_list, 
+      .f = quantreg_mod_coefs
+    )
+    
+    quantreg_coeff_list <- purrr::pmap(
+      .l = list(quantreg_coeff_list, numeric_predictors_i), 
+      .f = append_predictor_labels
+    )
+    
+    quantreg_interval_pred_mod_i <- data.frame(quantreg_coeff_list) # export this 
+    
+  } else {
+    
+    quantreg_interval_full_mod_i <- data.frame(quantreg_full = NA)
+    quantreg_interval_pred_mod_i  <- data.frame(quantreg_pred = NA)
+    
+  }
+  
+  # Variance ratios ####
+  
+  if(sim %in% c(2)){
+    
+    var_ratio_list <- suppressWarnings(
+      purrr::map(
+        .x = categorical_predictors_i, 
+        .f = ~var_ratio(mod = mod_i, cat_predictor = .x)
+      )
+    )
+    
+    var_ratio_coeff_list <- purrr::pmap(
+      .l = list(var_ratio_list, categorical_predictors_i), 
+      .f = append_predictor_labels
+    )
+    
+    var_ratios_i <- data.frame(var_ratio_coeff_list) # export this 
+    
+  } else {
+    
+    var_ratios_i <- data.frame(vr = NA)
+    
+  }
+  
+  # white test #### 
+  
+  wt_vals <- white_test(mod_i)
+  
+  # overall mod vals #### 
+  
+  overall_mod_vals_i <- mod_vals_overall(mod_i)
+  
+  return(
+    data.frame(
+      mod_vals_i, 
+      overall_mod_vals_i,
+      quantreg_interval_full_mod_i, 
+      quantreg_interval_pred_mod_i, 
+      var_ratios_i, 
+      wt_vals
+    )
+  )
+  
+}
+```
+
+# Sim 0: 1 continuous predictor
+
+-   Continuous predictor 1
+    -   b1: 0, 0.15, 0.39, 0.60
+    -   SD ratio: 1.15, 1.5, 2.2, 2.8
+    -   Variance pattern (><, <, <>)
+-   Sample size (30, 60, 120, 600)
+-   Proportion overlap (0, .25, .75, .95)
+
+Count: - 4(b1) * 4(n) * 4(prop) - 4(b1) * 4(n) * 4(prop) * 4(SD) * 3(VP)
+
+4*4*4 + 4*4*4*4*3: 832
+
+-   Method summaries
+-   Power summaries for each pattern
+
+## Combinations
+
+```{r}
+n_iter = 1000
+
+combinations_sim_0_vp1 <- tidyr::expand_grid(
+  
+  n_iter = 1:n_iter,
+  
+  b1 = c(0, 0.15, 0.39, 0.60),
+  
+  n = c(30, 60, 120, 600),
+  
+  vp_val = c(1),
+  
+  lower_quant = 0.025,
+  upper_quant = 0.975,
+  window_prop = 0.10,
+  prop_overlap = c(0, 0.25, 0.75, 0.95)
+)
+
+combinations_sim_0_vp2 <- tidyr::expand_grid(
+  
+  n_iter = 1:n_iter,
+  
+  b1 = c(0, 0.15, 0.39, 0.60),
+  
+  n = c(30, 60, 120, 600),
+  
+  vp_val = c(0.225, 0.400, 0.600, 1.100, 1.400),
+  #vp_val = c(0.02, 0.09, 0.16),
+  
+  lower_quant = 0.025,
+  upper_quant = 0.975,
+  window_prop = 0.10,
+  prop_overlap = c(0, 0.25, 0.75, 0.95)
+)
+
+combinations_sim_0_vp3 <- tidyr::expand_grid(
+  
+  n_iter = 1:n_iter,
+  
+  b1 = c(0, 0.15, 0.39, 0.60),
+  
+  n = c(30, 60, 120, 600),
+  
+  vp_val = c( -0.100, -0.200, -0.350, -0.650, -0.850),
+  #vp_val = c(-0.01, -0.04, -0.07),
+  
+  lower_quant = 0.025,
+  upper_quant = 0.975,
+  window_prop = 0.10,
+  prop_overlap = c(0, 0.25, 0.75, 0.95)
+)
+
+combinations_sim_0_vp4 <- tidyr::expand_grid(
+  
+  n_iter = 1:n_iter,
+  
+  b1 = c(0, 0.15, 0.39, 0.60),
+  
+  n = c(30, 60, 120, 600),
+  
+  vp_val = c(0.100, 0.200, 0.300, 0.500, 0.625),
+  #vp_val = c(0.01, 0.04, 0.075),
+  
+  lower_quant = 0.025,
+  upper_quant = 0.975,
+  window_prop = 0.10,
+  prop_overlap = c(0, 0.25, 0.75, 0.95)
+)
+
+dplyr::bind_rows(
+  combinations_sim_0_vp1, 
+  combinations_sim_0_vp2, 
+  combinations_sim_0_vp3, 
+  combinations_sim_0_vp4
+) |> nrow()
+```
+
+## VP1
+
+```{r}
+sim <- 0
+vp <- vp1
+
+start_time = Sys.time()
+
+sim_df_vp1 <- combinations_sim_0_vp1 |> 
+  dplyr::mutate(
+    sim_results = purrr::pmap(
+      .progress = TRUE, 
+      .l = list(
+        sim = sim, 
+        b1 = b1, 
+        b2 = NA, 
+        n = n,
+        vp_val = vp_val, 
+        lower_quant = lower_quant,
+        upper_quant = upper_quant,
+        window_prop = window_prop,
+        prop_overlap = prop_overlap
+      ), 
+      .f = run_sim
+    )
+  ) |> 
+  tidyr::unnest(sim_results)
+
+saveRDS(sim_df_vp1,
+        paste0("../data/simulation_exports/sim_0_vp1_", Sys.time(), ".rds"))
+
+end_time = Sys.time()
+end_time - start_time
+```
+
+## VP2
+
+```{r}
+sim <- 0
+vp <- vp2
+
+start_time = Sys.time()
+
+sim_df_vp2 <- combinations_sim_0_vp2 |> 
+  dplyr::mutate(
+    sim_results = purrr::pmap(
+      .progress = TRUE, 
+      .l = list(
+        sim = sim, 
+        b1 = b1, 
+        b2 = NA, 
+        n = n,
+        vp_val = vp_val, 
+        lower_quant = lower_quant,
+        upper_quant = upper_quant,
+        window_prop = window_prop,
+        prop_overlap = prop_overlap
+      ), 
+      .f = run_sim
+    )
+  ) |> 
+  tidyr::unnest(sim_results)
+
+saveRDS(sim_df_vp2, 
+        paste0("../data/simulation_exports/sim_0_vp2_", Sys.time(), ".rds"))
+
+end_time = Sys.time()
+end_time - start_time
+```
+
+## VP3
+
+```{r}
+sim <- 0
+vp <- vp3
+
+start_time = Sys.time()
+
+sim_df_vp3 <- combinations_sim_0_vp3 |> 
+  dplyr::mutate(
+    sim_results = purrr::pmap(
+      .progress = TRUE, 
+      .l = list(
+        sim = sim, 
+        b1 = b1, 
+        b2 = NA, 
+        n = n,
+        vp_val = vp_val, 
+        lower_quant = lower_quant,
+        upper_quant = upper_quant,
+        window_prop = window_prop,
+        prop_overlap = prop_overlap
+      ), 
+      .f = run_sim
+    )
+  ) |> 
+  tidyr::unnest(sim_results)
+
+saveRDS(sim_df_vp3, 
+        paste0("../data/simulation_exports/sim_0_vp3_", Sys.time(), ".rds"))
+
+end_time = Sys.time()
+end_time - start_time
+```
+
+## VP4
+
+```{r}
+sim <- 0
+vp <- vp4
+
+start_time = Sys.time()
+
+sim_df_vp4 <- combinations_sim_0_vp4 |> 
+  dplyr::mutate(
+    sim_results = purrr::pmap(
+      .progress = TRUE, 
+      .l = list(
+        sim = sim, 
+        b1 = b1, 
+        b2 = NA, 
+        n = n,
+        vp_val = vp_val, 
+        lower_quant = lower_quant,
+        upper_quant = upper_quant,
+        window_prop = window_prop,
+        prop_overlap = prop_overlap
+      ), 
+      .f = run_sim
+    )
+  ) |> 
+  tidyr::unnest(sim_results)
+
+saveRDS(sim_df_vp4, 
+        paste0("../data/simulation_exports/sim_0_vp4_", Sys.time(), ".rds"))
+
+end_time = Sys.time()
+end_time - start_time
+```
+
+# Sim 1: Continuous only (1 heteroscedastic predictor 1 homoscedastic predictor)
+
+Design: - Continuous predictor 1 - b1: 0.39, - SD ratio: 1.15, 2.8 -
+Variance pattern (\>\<, \<, \<\>)
+
+-   Continuous predictor 2
+
+    -   b2: 0.15, 0.60
+    -   SD ratio: 1
+
+-   Sample size (30, 60, 120, 600)
+
+-   Proportion overlap (0, .25, .75, .95)
+
+Total: - 1(b1) \* 2(b2) \* 4(n) \* 4(overlap) - 1(b1) \* 2(SD) \* 4(n)
+\* 4(overlap) \* 3(VP) \* 2(b2)
+
+1*2*4*4 + 1*2*3*2*4*4 = 224 \* 1000
+
+-   Summaries for method but not power
+
+## Combinations
+
+```{r}
+n_iter = 1000
+
+combinations_sim_1_vp1 <- tidyr::expand_grid(
+  
+  n_iter = 1:n_iter,
+  
+  b1 = c(0, 0.15, 0.60),
+  b2 = c(0, 0.15, 0.60),
+  
+  n = c(30, 60, 120, 500),
+  
+  vp_val = c(1),
+  
+  lower_quant = 0.025,
+  upper_quant = 0.975,
+  window_prop = 0.10,
+  prop_overlap = c(0, 0.25, 0.75, 0.95)
+)
+
+combinations_sim_1_vp2 <- tidyr::expand_grid(
+  
+  n_iter = 1:n_iter,
+  
+  b1 = c(0.15, 0.60),
+  b2 = c(0.15, 0.60),
+  
+  n = c(30, 60, 120, 500),
+  
+  vp_val = c(0.225, 1.400),
+  
+  lower_quant = 0.025,
+  upper_quant = 0.975,
+  window_prop = 0.10,
+  prop_overlap = c(0, 0.25, 0.75, 0.95)
+)
+
+combinations_sim_1_vp3 <- tidyr::expand_grid(
+  
+  n_iter = 1:n_iter,
+  
+  b1 = c(0.15, 0.60),
+  b2 = c(0.15, 0.60),
+  
+  n = c(30, 60, 120, 500),
+  
+  vp_val = c(-0.100, -0.850),
+  
+  lower_quant = 0.025,
+  upper_quant = 0.975,
+  window_prop = 0.10,
+  prop_overlap = c(0, 0.25, 0.75, 0.95)
+)
+
+combinations_sim_1_vp4 <- tidyr::expand_grid(
+  
+  n_iter = 1:n_iter,
+  
+  b1 = 0.39,
+  b2 = c(0.15, 0.60),
+  
+  n = c(30, 60, 120, 500),
+  
+  vp_val = c(0.100, 0.625),
+  
+  lower_quant = 0.025,
+  upper_quant = 0.975,
+  window_prop = 0.10,
+  prop_overlap = c(0, 0.25, 0.75, 0.95)
+)
+
+dplyr::bind_rows(
+  combinations_sim_1_vp1, 
+  combinations_sim_1_vp2, 
+  combinations_sim_1_vp3, 
+  combinations_sim_1_vp4
+) |> nrow()
+```
+
+## VP1
+
+```{r}
+sim <- 1
+vp <- vp1
+
+start_time = Sys.time()
+
+sim_df_vp1 <- combinations_sim_1_vp1 |> 
+  dplyr::mutate(
+    sim_results = purrr::pmap(
+      .progress = TRUE, 
+      .l = list(
+        sim = sim, 
+        b1 = b1, 
+        b2 = b2, 
+        n = n,
+        vp_val = vp_val, 
+        lower_quant = lower_quant,
+        upper_quant = upper_quant,
+        window_prop = window_prop,
+        prop_overlap = prop_overlap
+      ), 
+      .f = run_sim
+    )
+  ) |> 
+  tidyr::unnest(sim_results)
+
+saveRDS(sim_df_vp1, 
+        paste0("../data/simulation_exports/sim_1_vp1_", Sys.time(), ".rds"))
+
+end_time = Sys.time()
+end_time - start_time
+```
+
+## VP2
+
+```{r}
+sim <- 1
+vp <- vp2
+
+start_time = Sys.time()
+
+sim_df_vp2 <- combinations_sim_1_vp2 |> 
+  dplyr::mutate(
+    sim_results = purrr::pmap(
+      .progress = TRUE, 
+      .l = list(
+        sim = sim, 
+        b1 = b1, 
+        b2 = b2, 
+        n = n,
+        vp_val = vp_val, 
+        lower_quant = lower_quant,
+        upper_quant = upper_quant,
+        window_prop = window_prop,
+        prop_overlap = prop_overlap
+      ), 
+      .f = run_sim
+    )
+  ) |> 
+  tidyr::unnest(sim_results)
+
+saveRDS(sim_df_vp2, 
+        paste0("../data/simulation_exports/sim_1_vp2_", Sys.time(), ".rds"))
+
+end_time = Sys.time()
+end_time - start_time
+```
+
+## VP3
+
+```{r}
+sim <- 1
+vp <- vp3
+
+start_time = Sys.time()
+
+sim_df_vp3 <- combinations_sim_1_vp3 |> 
+  dplyr::mutate(
+    sim_results = purrr::pmap(
+      .progress = TRUE, 
+      .l = list(
+        sim = sim, 
+        b1 = b1, 
+        b2 = b2, 
+        n = n,
+        vp_val = vp_val, 
+        lower_quant = lower_quant,
+        upper_quant = upper_quant,
+        window_prop = window_prop,
+        prop_overlap = prop_overlap
+      ), 
+      .f = run_sim
+    )
+  ) |> 
+  tidyr::unnest(sim_results)
+
+saveRDS(sim_df_vp3, 
+        paste0("../data/simulation_exports/sim_1_vp3_", Sys.time(), ".rds"))
+
+end_time = Sys.time()
+end_time - start_time
+```
+
+## VP4
+
+```{r}
+sim <- 1
+vp <- vp4
+
+start_time = Sys.time()
+
+sim_df_vp4 <- combinations_sim_1_vp4 |> 
+  dplyr::mutate(
+    sim_results = purrr::pmap(
+      .progress = TRUE, 
+      .l = list(
+        sim = sim, 
+        b1 = b1, 
+        b2 = b2, 
+        n = n,
+        vp_val = vp_val, 
+        lower_quant = lower_quant,
+        upper_quant = upper_quant,
+        window_prop = window_prop,
+        prop_overlap = prop_overlap
+      ), 
+      .f = run_sim
+    )
+  ) |> 
+  tidyr::unnest(sim_results)
+
+saveRDS(sim_df_vp4, 
+        paste0("../data/simulation_exports/sim_1_vp4_", Sys.time(), ".rds"))
+
+end_time = Sys.time()
+end_time - start_time
+```
+
+# Sim 2: Mixed (1 heteroscedastic categorical predictor 1 homoscedastic continuous predictor)
+
+Design: - Categorical predictor - b1: 0.15, 0.39, 0.60 - b2: 0.15, 0.39,
+0.60
+
+-   Continuous predictor
+
+    -   b_c1: 0.15, 0.60
+
+-   Variance patterns: 1-1-1, 2.8-1-2.8, 1-2.8-1
+
+-   Sample size (30, 60, 120, 600)
+
+-   Prop overlap (0, 0.25, 0.75, 0.95)
+
+Count: - 3(b1) \* 3(b2) \* 2(b_c1) \* 3(VP) \* 4(n) \* 4(prop overlap)
+
+3*3*2*3*4\*4 = 864
+
+-   Method summaries
+-   Power summaries for b1, b2 and total model
+
+## Combinations
+
+```{r}
+n_iter = 1000
+
+combinations_sim_2_vp1 <- tidyr::expand_grid(
+  
+  n_iter = 1:n_iter,
+  
+  b1 = c(0.15, 0.39, 0.60),
+  b2 = c(0.15, 0.39, 0.60),
+  
+  b_c1 = c(0.15, 0.60),
+  # 
+  
+  var_pattern = c("1-1-1"),
+  
+  n = c(30, 60, 120, 600),
+  
+  lower_quant = 0.025,
+  upper_quant = 0.975,
+  window_prop = 0.10,
+  prop_overlap = c(0, 0.25, 0.75, 0.95)
+)
+
+combinations_sim_2_vp2 <- tidyr::expand_grid(
+  
+  n_iter = 1:n_iter,
+  
+  b1 = c(0.15, 0.39, 0.60),
+  b2 = c(0.15, 0.39, 0.60),
+  
+  b_c1 = c(0.15, 0.60),
+  # 
+  
+  var_pattern = c("2.8-1-2.8"),
+  
+  n = c(30, 60, 120, 600),
+  
+  lower_quant = 0.025,
+  upper_quant = 0.975,
+  window_prop = 0.10,
+  prop_overlap = c(0, 0.25, 0.75, 0.95)
+)
+
+combinations_sim_2_vp3 <- tidyr::expand_grid(
+  
+  n_iter = 1:n_iter,
+  
+  b1 = c(0.15, 0.39, 0.60),
+  b2 = c(0.15, 0.39, 0.60),
+  
+  b_c1 = c(0.15, 0.60),
+  # 
+  
+  var_pattern = c("1-2.8-1"),
+  
+  n = c(30, 60, 120, 600),
+  
+  lower_quant = 0.025,
+  upper_quant = 0.975,
+  window_prop = 0.10,
+  prop_overlap = c(0, 0.25, 0.75, 0.95)
+)
+```
+
+## VP1
+
+```{r}
+sim <- 2
+
+start_time = Sys.time()
+
+sim_df_2_vp1 <- combinations_sim_2_vp1 |> 
+  dplyr::mutate(
+    sim_results = purrr::pmap(
+      .progress = TRUE, 
+      .l = list(
+        sim = sim, 
+        b1 = b1, 
+        b2 = b2, 
+        b_c1 = b_c1,
+        var_pattern = var_pattern,
+        n = n,
+        lower_quant = lower_quant,
+        upper_quant = upper_quant,
+        window_prop = window_prop,
+        prop_overlap = prop_overlap
+      ), 
+      .f = run_sim
+    )
+  ) |> 
+  tidyr::unnest(sim_results)
+
+saveRDS(sim_df_2_vp1, 
+        paste0("../data/simulation_exports/sim_2_vp1_", Sys.time(), ".rds"))
+
+end_time = Sys.time()
+end_time - start_time
+```
+
+## VP2
+
+```{r}
+sim <- 2
+
+start_time = Sys.time()
+
+sim_df_2_vp2 <- combinations_sim_2_vp2 |> 
+  dplyr::mutate(
+    sim_results = purrr::pmap(
+      .progress = TRUE, 
+      .l = list(
+        sim = sim, 
+        b1 = b1, 
+        b2 = b2, 
+        b_c1 = b_c1,
+        var_pattern = var_pattern,
+        n = n,
+        lower_quant = lower_quant,
+        upper_quant = upper_quant,
+        window_prop = window_prop,
+        prop_overlap = prop_overlap
+      ), 
+      .f = run_sim
+    )
+  ) |> 
+  tidyr::unnest(sim_results)
+
+saveRDS(sim_df_2_vp2, 
+        paste0("../data/simulation_exports/sim_2_vp2_", Sys.time(), ".rds"))
+
+end_time = Sys.time()
+end_time - start_time
+```
+
+## VP3
+
+```{r}
+sim <- 2
+
+start_time = Sys.time()
+
+sim_df_2_vp3 <- combinations_sim_2_vp3 |> 
+  dplyr::mutate(
+    sim_results = purrr::pmap(
+      .progress = TRUE, 
+      .l = list(
+        sim = sim, 
+        b1 = b1, 
+        b2 = b2, 
+        b_c1 = b_c1,
+        var_pattern = var_pattern,
+        n = n,
+        lower_quant = lower_quant,
+        upper_quant = upper_quant,
+        window_prop = window_prop,
+        prop_overlap = prop_overlap
+      ), 
+      .f = run_sim
+    )
+  ) |> 
+  tidyr::unnest(sim_results)
+
+saveRDS(sim_df_2_vp3, 
+        paste0("../data/simulation_exports/sim_2_vp3_", Sys.time(), ".rds"))
+
+end_time = Sys.time()
+end_time - start_time
+```
+
